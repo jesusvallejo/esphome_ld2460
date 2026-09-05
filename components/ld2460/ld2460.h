@@ -70,11 +70,9 @@ class LD2460Component : public Component, public uart::UARTDevice {
     float angle_deg{0.0f};
   };
 
-  void send_startup_commands_();
   void send_enable_reporting_command_();
+  void send_query_mode_command_();
   void send_query_version_command_();
-  void log_uart_pin_levels_();
-  void select_next_baud_rate_();
   void process_rx_buffer_();
   void process_report_frame_(const std::vector<uint8_t> &frame);
   void process_command_frame_(const std::vector<uint8_t> &frame);
@@ -106,18 +104,22 @@ class LD2460Component : public Component, public uart::UARTDevice {
   uint32_t last_byte_ms_{0};
   uint32_t total_bytes_{0};
   uint32_t last_no_data_log_ms_{0};
-  uint32_t last_command_ms_{0};
   uint32_t last_publish_ms_{0};
   uint32_t last_report_log_ms_{0};
   uint32_t publish_interval_ms_{500};
   uint32_t report_log_interval_ms_{1000};
   uint8_t last_published_target_count_{0};
-  uint8_t baud_index_{0};
   bool baud_scan_{true};
   bool enable_reporting_{true};
-  bool startup_commands_sent_{false};
   bool has_published_targets_{false};
   uint32_t no_data_log_interval_ms_{10000};
+
+  // Command state tracking variables
+  bool firmware_received_{false};
+  bool mode_received_{false};
+  uint8_t command_step_{0};
+  uint32_t last_step_ms_{0};
+  uint32_t last_command_retry_ms_{0};
 };
 
 }  // namespace ld2460
