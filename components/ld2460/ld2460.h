@@ -53,6 +53,16 @@ class LD2460Component : public Component, public uart::UARTDevice {
     this->report_log_interval_ms_ = report_log_interval_ms;
   }
 
+  // Zone bounds and distance threshold setters
+  void set_max_distance(float max_distance) { this->max_distance_ = max_distance; }
+  void set_min_x(float min_x) { this->min_x_ = min_x; }
+  void set_max_x(float max_x) { this->max_x_ = max_x; }
+  void set_min_y(float min_y) { this->min_y_ = min_y; }
+  void set_max_y(float max_y) { this->max_y_ = max_y; }
+
+  // Hardware configuration trigger
+  void update_hardware_zone_bounds(float min_x, float max_x, float min_y, float max_y);
+
  protected:
   struct TargetSensors {
     sensor::Sensor *x{nullptr};
@@ -73,6 +83,7 @@ class LD2460Component : public Component, public uart::UARTDevice {
   void send_enable_reporting_command_();
   void send_query_mode_command_();
   void send_query_version_command_();
+  void send_set_zone_bounds_command_(int16_t min_x_cm, int16_t max_x_cm, int16_t min_y_cm, int16_t max_y_cm);
   void process_rx_buffer_();
   void process_report_frame_(const std::vector<uint8_t> &frame);
   void process_command_frame_(const std::vector<uint8_t> &frame);
@@ -113,6 +124,13 @@ class LD2460Component : public Component, public uart::UARTDevice {
   bool enable_reporting_{true};
   bool has_published_targets_{false};
   uint32_t no_data_log_interval_ms_{10000};
+
+  // Detection bounds (in meters)
+  float max_distance_{8.0f};
+  float min_x_{-6.0f};
+  float max_x_{6.0f};
+  float min_y_{0.0f};
+  float max_y_{8.0f};
 
   bool firmware_received_{false};
   bool mode_received_{false};
