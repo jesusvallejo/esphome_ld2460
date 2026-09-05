@@ -52,20 +52,22 @@ void LD2460Component::dump_config() {
 void LD2460Component::loop() {
   const uint32_t now = millis();
 
-  if (this->enable_reporting_ && now > 2000) {
-    if (!this->startup_commands_sent_) {
-      // Always send the startup command at least once after 2 seconds
-      this->select_next_baud_rate_();
-      this->log_uart_pin_levels_();
-      this->send_startup_commands_();
-      this->startup_commands_sent_ = true;
-      this->last_command_ms_ = now;
-    } else if (this->baud_scan_ && this->total_bytes_ == 0 && now - this->last_command_ms_ >= 10000) {
-      // If we sent the commands but STILL have no data after 10s, scan the next baud rate
-      this->select_next_baud_rate_();
-      this->log_uart_pin_levels_();
-      this->send_startup_commands_();
-      this->last_command_ms_ = now;
+  // Staggered command retry sequence every 5 seconds until responses arrive
+  if (this->enable_reporting_ && now > 2000 && (!this->firmware_received_ || !this->mode_received_)) {
+    if (now - this->last_command_retry_ms_ >= 5000) {
+      if (this->command_step_ == 0) {
+        this->send_enable_reporting_command_();
+        this->command_step_ = 1;
+        this->last_step_ms_ = now;
+      } else if (this->command_step_ == 1 && now - this->last_step_ms_ >= 300) {
+        this->send_query_mode_command_();
+        this->command_step_ = 2;
+        this->last_step_ms_ = now;
+      } else if (this->command_step_ == 2 && now - this->last_step_ms_ >= 300) {
+        this->send_query_version_command_();
+        this->command_step_ = 0;
+        this->last_command_retry_ms_ = now;
+      }
     }
   }
 
@@ -90,61 +92,48 @@ void LD2460Component::loop() {
 
   if (this->total_bytes_ == 0 && this->no_data_log_interval_ms_ > 0 &&
       now - this->last_no_data_log_ms_ >= this->no_data_log_interval_ms_) {
-    ESP_LOGW(TAG, "No UART bytes received yet on RX. Check LD2460 TX -> ESP GPIO17/D7, common GND, power, and baud.");
+    ESP_LOGW(TAG, "No UART bytes received yet on RX. Check LD2460 TX -> ESP RX, common GND, power, and baud.");
     this->last_no_data_log_ms_ = now;
   }
-}
-
-void LD2460Component::send_startup_commands_() {
-  this->send_enable_reporting_command_();
-  this->send_query_version_command_();
 }
 
 void LD2460Component::send_enable_reporting_command_() {
   static const uint8_t ENABLE_REPORTING[] = {
       0xFD, 0xFC, 0xFB, 0xFA,  // Frame header
-      0x06,                    // Open/close reporting function
-      0x0C, 0x00,              // Total frame length, little endian
-      0x01,                    // Enable reporting
-      0x04, 0x03, 0x02, 0x01   // Frame tail
+      0x06,                    // Function code: Open/close reporting function
+      0x0C, 0x00,              // Data length (12)
+      0x01,                    // 01: Enable reporting
+      0x04, 0x03, 0x02, 0x01   // Frame end
   };
   this->write_array(ENABLE_REPORTING, sizeof(ENABLE_REPORTING));
   this->flush();
-  ESP_LOGI(TAG, "Sent LD2460 enable-reporting command.");
+  ESP_LOGI(TAG, "Sent LD2460 enable-reporting command (0x06).");
+}
+
+void LD2460Component::send_query_mode_command_() {
+  static const uint8_t QUERY_MODE[] = {
+      0xFD, 0xFC, 0xFB, 0xFA,  // Frame header
+      0x0A,                    // Function code: Query installation mode
+      0x0C, 0x00,              // Data length (12)
+      0x01,                    // Payload
+      0x04, 0x03, 0x02, 0x01   // Frame end
+  };
+  this->write_array(QUERY_MODE, sizeof(QUERY_MODE));
+  this->flush();
+  ESP_LOGI(TAG, "Sent LD2460 query-mode command (0x0A).");
 }
 
 void LD2460Component::send_query_version_command_() {
   static const uint8_t QUERY_VERSION[] = {
       0xFD, 0xFC, 0xFB, 0xFA,  // Frame header
-      0x0B,                    // Query firmware version
-      0x0C, 0x00,              // Total frame length, little endian
-      0x01,                    // Query payload
-      0x04, 0x03, 0x02, 0x01   // Frame tail
+      0x0B,                    // Function code: Query firmware version
+      0x0C, 0x00,              // Data length (12)
+      0x01,                    // Payload
+      0x04, 0x03, 0x02, 0x01   // Frame end
   };
   this->write_array(QUERY_VERSION, sizeof(QUERY_VERSION));
   this->flush();
-  ESP_LOGI(TAG, "Sent LD2460 query-version command.");
-}
-
-void LD2460Component::select_next_baud_rate_() {
-  if (!this->baud_scan_ && this->startup_commands_sent_)
-    return;
-
-  const uint32_t baud_rate = BAUD_RATES[this->baud_index_];
-  this->parent_->set_baud_rate(baud_rate);
-  this->parent_->load_settings(false);
-  ESP_LOGI(TAG, "Testing LD2460 UART baud rate: %" PRIu32, baud_rate);
-
-  if (this->baud_scan_)
-    this->baud_index_ = (this->baud_index_ + 1) % (sizeof(BAUD_RATES) / sizeof(BAUD_RATES[0]));
-}
-
-void LD2460Component::log_uart_pin_levels_() {
-#ifdef USE_ESP32
-  const int tx_level = gpio_get_level(GPIO_NUM_16);
-  const int rx_level = gpio_get_level(GPIO_NUM_17);
-  ESP_LOGI(TAG, "UART pin levels before command: GPIO16/D6/TX=%d, GPIO17/D7/RX=%d", tx_level, rx_level);
-#endif
+  ESP_LOGI(TAG, "Sent LD2460 query-version command (0x0B).");
 }
 
 void LD2460Component::set_target_x_sensor(uint8_t index, sensor::Sensor *target_x_sensor) {
@@ -295,7 +284,8 @@ void LD2460Component::process_command_frame_(const std::vector<uint8_t> &frame) 
       if (payload_length < 1)
         break;
       const char *mode = installation_mode_to_string_(frame[payload_offset]);
-      ESP_LOGI(TAG, "LD2460 installation mode: %s", mode);
+      ESP_LOGI(TAG, "LD2460 installation mode received: %s", mode);
+      this->mode_received_ = true;
       if (this->installation_mode_text_sensor_ != nullptr)
         this->installation_mode_text_sensor_->publish_state(mode);
       break;
@@ -312,8 +302,11 @@ void LD2460Component::process_command_frame_(const std::vector<uint8_t> &frame) 
 
       char firmware[48];
       std::snprintf(firmware, sizeof(firmware), "%s V%u.%u (20%02u-%02u)", mode, major, minor, year, month);
-      ESP_LOGI(TAG, "LD2460 firmware: %s", firmware);
+      ESP_LOGI(TAG, "LD2460 firmware received: %s", firmware);
       
+      this->firmware_received_ = true;
+      this->mode_received_ = true;
+
       if (this->firmware_text_sensor_ != nullptr)
         this->firmware_text_sensor_->publish_state(firmware);
       if (this->installation_mode_text_sensor_ != nullptr)
@@ -455,7 +448,7 @@ std::string LD2460Component::format_frame_(const std::vector<uint8_t> &bytes) {
   ascii.reserve(bytes.size());
   for (const auto byte : bytes) {
     if (std::isprint(static_cast<unsigned char>(byte)))
-      ascii += static_cast<char>(byte);
+      ascii += static_char(byte);
     else
       ascii += '.';
   }
