@@ -114,7 +114,6 @@ class LD2460Component : public Component, public uart::UARTDevice {
   bool has_published_targets_{false};
   uint32_t no_data_log_interval_ms_{10000};
 
-  // Command state tracking variables
   bool firmware_received_{false};
   bool mode_received_{false};
   uint8_t command_step_{0};
