@@ -8,24 +8,18 @@
 #include <cmath>
 #include <cstdio>
 
-#ifdef USE_ESP32
-#include <driver/gpio.h>
-#endif
-
 namespace esphome {
 namespace ld2460 {
 
 static const char *const TAG = "ld2460";
-static const uint32_t BAUD_RATES[] = {115200, 9600, 19200, 38400, 57600, 230400, 256000, 460800};
 static const float RAD_TO_DEG = 57.2957795131f;
 
 void LD2460Component::setup() { this->rx_buffer_.reserve(this->max_buffer_size_); }
 
 void LD2460Component::dump_config() {
-  ESP_LOGCONFIG(TAG, "HLK-LD2460 raw UART reader:");
+  ESP_LOGCONFIG(TAG, "HLK-LD2460 Target Detection Radar:");
   ESP_LOGCONFIG(TAG, "  Flush timeout: %" PRIu32 " ms", this->flush_timeout_ms_);
   ESP_LOGCONFIG(TAG, "  Max buffer size: %u byte(s)", this->max_buffer_size_);
-  ESP_LOGCONFIG(TAG, "  Baud scan: %s", YESNO(this->baud_scan_));
   ESP_LOGCONFIG(TAG, "  Enable reporting on boot: %s", YESNO(this->enable_reporting_));
   ESP_LOGCONFIG(TAG, "  No-data log interval: %" PRIu32 " ms", this->no_data_log_interval_ms_);
   ESP_LOGCONFIG(TAG, "  Publish interval: %" PRIu32 " ms", this->publish_interval_ms_);
@@ -52,7 +46,6 @@ void LD2460Component::dump_config() {
 void LD2460Component::loop() {
   const uint32_t now = millis();
 
-  // Staggered command retry sequence every 5 seconds until responses arrive
   if (this->enable_reporting_ && now > 2000 && (!this->firmware_received_ || !this->mode_received_)) {
     if (now - this->last_command_retry_ms_ >= 5000) {
       if (this->command_step_ == 0) {
@@ -92,7 +85,7 @@ void LD2460Component::loop() {
 
   if (this->total_bytes_ == 0 && this->no_data_log_interval_ms_ > 0 &&
       now - this->last_no_data_log_ms_ >= this->no_data_log_interval_ms_) {
-    ESP_LOGW(TAG, "No UART bytes received yet on RX. Check LD2460 TX -> ESP RX, common GND, power, and baud.");
+    ESP_LOGW(TAG, "No UART bytes received yet on RX. Check LD2460 TX -> ESP RX and baud rate.");
     this->last_no_data_log_ms_ = now;
   }
 }
@@ -102,7 +95,7 @@ void LD2460Component::send_enable_reporting_command_() {
       0xFD, 0xFC, 0xFB, 0xFA,  // Frame header
       0x06,                    // Function code: Open/close reporting function
       0x0C, 0x00,              // Data length (12)
-      0x01,                    // 01: Enable reporting
+      0x01,                    // Payload: 01 enable
       0x04, 0x03, 0x02, 0x01   // Frame end
   };
   this->write_array(ENABLE_REPORTING, sizeof(ENABLE_REPORTING));
@@ -168,8 +161,7 @@ void LD2460Component::process_rx_buffer_() {
 
     const uint16_t frame_length = read_u16_le_(this->rx_buffer_, 5);
     if (frame_length < 11 || frame_length > this->max_buffer_size_) {
-      ESP_LOGW(TAG, "Invalid LD2460 frame length %u in: %s", frame_length,
-               format_frame_(this->rx_buffer_).c_str());
+      ESP_LOGW(TAG, "Invalid LD2460 frame length %u in RX buffer", frame_length);
       this->rx_buffer_.erase(this->rx_buffer_.begin());
       continue;
     }
@@ -182,7 +174,7 @@ void LD2460Component::process_rx_buffer_() {
 
     if (is_report_header_(frame)) {
       if (!has_report_footer_(frame)) {
-        ESP_LOGW(TAG, "LD2460 report with invalid footer: %s", format_frame_(frame).c_str());
+        ESP_LOGW(TAG, "LD2460 report missing valid footer");
         continue;
       }
       this->process_report_frame_(frame);
@@ -191,7 +183,7 @@ void LD2460Component::process_rx_buffer_() {
 
     if (is_command_header_(frame)) {
       if (!has_command_footer_(frame)) {
-        ESP_LOGW(TAG, "LD2460 command frame with invalid footer: %s", format_frame_(frame).c_str());
+        ESP_LOGW(TAG, "LD2460 command reply missing valid footer");
         continue;
       }
       this->process_command_frame_(frame);
@@ -201,20 +193,17 @@ void LD2460Component::process_rx_buffer_() {
 
 void LD2460Component::process_report_frame_(const std::vector<uint8_t> &frame) {
   const uint8_t function_code = frame[4];
-  if (function_code != 0x04) {
-    ESP_LOGD(TAG, "LD2460 report-like frame function=0x%02X: %s", function_code, format_frame_(frame).c_str());
+  if (function_code != 0x04)
     return;
-  }
 
   const uint16_t frame_length = read_u16_le_(frame, 5);
   if (frame_length < 11 || (frame_length - 11) % 4 != 0) {
-    ESP_LOGW(TAG, "LD2460 target report has invalid length %u: %s", frame_length, format_frame_(frame).c_str());
+    ESP_LOGW(TAG, "LD2460 report packet has invalid byte length: %u", frame_length);
     return;
   }
 
   uint8_t target_count = static_cast<uint8_t>((frame_length - 11) / 4);
   if (target_count > MAX_TARGETS) {
-    ESP_LOGW(TAG, "LD2460 reported %u targets; only %u are exposed", target_count, MAX_TARGETS);
     target_count = MAX_TARGETS;
   }
 
@@ -247,10 +236,7 @@ void LD2460Component::process_report_frame_(const std::vector<uint8_t> &frame) {
   if (now - this->last_report_log_ms_ >= this->report_log_interval_ms_) {
     ESP_LOGI(TAG, "LD2460 target report: %s", summary.c_str());
     this->last_report_log_ms_ = now;
-  } else {
-    ESP_LOGD(TAG, "LD2460 target report: %s", summary.c_str());
   }
-  ESP_LOGD(TAG, "LD2460 report raw: %s", format_frame_(frame).c_str());
 
   if (this->target_state_changed_(targets, target_count) && now - this->last_publish_ms_ >= this->publish_interval_ms_) {
     this->publish_targets_(targets, target_count, summary);
@@ -293,7 +279,7 @@ void LD2460Component::process_command_frame_(const std::vector<uint8_t> &frame) 
     case 0x0B: {
       if (payload_length < 5)
         break;
-      
+
       const char *mode = installation_mode_to_string_(frame[payload_offset]);
       const uint8_t year = frame[payload_offset + 1];
       const uint8_t month = frame[payload_offset + 2];
@@ -302,8 +288,8 @@ void LD2460Component::process_command_frame_(const std::vector<uint8_t> &frame) 
 
       char firmware[48];
       std::snprintf(firmware, sizeof(firmware), "%s V%u.%u (20%02u-%02u)", mode, major, minor, year, month);
-      ESP_LOGI(TAG, "LD2460 firmware received: %s", firmware);
-      
+      ESP_LOGI(TAG, "LD2460 firmware version received: %s", firmware);
+
       this->firmware_received_ = true;
       this->mode_received_ = true;
 
@@ -314,8 +300,7 @@ void LD2460Component::process_command_frame_(const std::vector<uint8_t> &frame) 
       break;
     }
     default:
-      ESP_LOGI(TAG, "LD2460 command/ack function=0x%02X payload=%u byte(s): %s", function_code,
-               static_cast<unsigned>(payload_length), format_frame_(frame).c_str());
+      ESP_LOGI(TAG, "LD2460 frame received for command 0x%02X", function_code);
       break;
   }
 
@@ -448,7 +433,7 @@ std::string LD2460Component::format_frame_(const std::vector<uint8_t> &bytes) {
   ascii.reserve(bytes.size());
   for (const auto byte : bytes) {
     if (std::isprint(static_cast<unsigned char>(byte)))
-      ascii += static_char(byte);
+      ascii += static_cast<char>(byte);
     else
       ascii += '.';
   }
