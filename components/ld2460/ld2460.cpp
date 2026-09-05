@@ -3,6 +3,7 @@
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cinttypes>
 #include <cmath>
@@ -24,6 +25,10 @@ void LD2460Component::dump_config() {
   ESP_LOGCONFIG(TAG, "  No-data log interval: %" PRIu32 " ms", this->no_data_log_interval_ms_);
   ESP_LOGCONFIG(TAG, "  Publish interval: %" PRIu32 " ms", this->publish_interval_ms_);
   ESP_LOGCONFIG(TAG, "  Report log interval: %" PRIu32 " ms", this->report_log_interval_ms_);
+  ESP_LOGCONFIG(TAG, "  Detection Bounds:");
+  ESP_LOGCONFIG(TAG, "    Max Distance: %.2f m", this->max_distance_);
+  ESP_LOGCONFIG(TAG, "    X Bounds: [%.2f m, %.2f m]", this->min_x_, this->max_x_);
+  ESP_LOGCONFIG(TAG, "    Y Bounds: [%.2f m, %.2f m]", this->min_y_, this->max_y_);
   this->check_uart_settings(115200, 1, uart::UART_CONFIG_PARITY_NONE, 8);
   LOG_TEXT_SENSOR("  ", "Raw UART", this->raw_text_sensor_);
   LOG_TEXT_SENSOR("  ", "Summary", this->summary_text_sensor_);
@@ -93,7 +98,7 @@ void LD2460Component::loop() {
 void LD2460Component::send_enable_reporting_command_() {
   static const uint8_t ENABLE_REPORTING[] = {
       0xFD, 0xFC, 0xFB, 0xFA,  // Frame header
-      0x06,                    // Function code: Open/close reporting function
+      0x06,                    // Function code: Open/close reporting
       0x0C, 0x00,              // Data length (12)
       0x01,                    // Payload: 01 enable
       0x04, 0x03, 0x02, 0x01   // Frame end
@@ -127,6 +132,49 @@ void LD2460Component::send_query_version_command_() {
   this->write_array(QUERY_VERSION, sizeof(QUERY_VERSION));
   this->flush();
   ESP_LOGI(TAG, "Sent LD2460 query-version command (0x0B).");
+}
+
+void LD2460Component::send_set_zone_bounds_command_(int16_t min_x_cm, int16_t max_x_cm, int16_t min_y_cm, int16_t max_y_cm) {
+  uint8_t frame[19];
+  frame[0] = 0xFD;
+  frame[1] = 0xFC;
+  frame[2] = 0xFB;
+  frame[3] = 0xFA;
+  frame[4] = 0x07;  // Function code: Set detection area filtering
+  frame[5] = 0x13;  // Total frame length (19 bytes)
+  frame[6] = 0x00;
+
+  frame[7] = static_cast<uint8_t>(min_x_cm & 0xFF);
+  frame[8] = static_cast<uint8_t>((min_x_cm >> 8) & 0xFF);
+  frame[9] = static_cast<uint8_t>(max_x_cm & 0xFF);
+  frame[10] = static_cast<uint8_t>((max_x_cm >> 8) & 0xFF);
+  frame[11] = static_cast<uint8_t>(min_y_cm & 0xFF);
+  frame[12] = static_cast<uint8_t>((min_y_cm >> 8) & 0xFF);
+  frame[13] = static_cast<uint8_t>(max_y_cm & 0xFF);
+  frame[14] = static_cast<uint8_t>((max_y_cm >> 8) & 0xFF);
+
+  frame[15] = 0x04;
+  frame[16] = 0x03;
+  frame[17] = 0x02;
+  frame[18] = 0x01;
+
+  this->write_array(frame, sizeof(frame));
+  this->flush();
+  ESP_LOGI(TAG, "Sent hardware zone bounds frame (0x07): X[%d, %d] cm, Y[%d, %d] cm", min_x_cm, max_x_cm, min_y_cm, max_y_cm);
+}
+
+void LD2460Component::update_hardware_zone_bounds(float min_x, float max_x, float min_y, float max_y) {
+  this->min_x_ = min_x;
+  this->max_x_ = max_x;
+  this->min_y_ = min_y;
+  this->max_y_ = max_y;
+
+  const int16_t min_x_cm = static_cast<int16_t>(min_x * 100.0f);
+  const int16_t max_x_cm = static_cast<int16_t>(max_x * 100.0f);
+  const int16_t min_y_cm = static_cast<int16_t>(min_y * 100.0f);
+  const int16_t max_y_cm = static_cast<int16_t>(max_y * 100.0f);
+
+  this->send_set_zone_bounds_command_(min_x_cm, max_x_cm, min_y_cm, max_y_cm);
 }
 
 void LD2460Component::set_target_x_sensor(uint8_t index, sensor::Sensor *target_x_sensor) {
@@ -202,15 +250,12 @@ void LD2460Component::process_report_frame_(const std::vector<uint8_t> &frame) {
     return;
   }
 
-  uint8_t target_count = static_cast<uint8_t>((frame_length - 11) / 4);
-  if (target_count > MAX_TARGETS) {
-    target_count = MAX_TARGETS;
-  }
+  const uint8_t raw_target_count = static_cast<uint8_t>((frame_length - 11) / 4);
 
-  Target targets[MAX_TARGETS]{};
-  std::string summary = "targets=" + std::to_string(target_count);
+  Target valid_targets[MAX_TARGETS]{};
+  uint8_t valid_target_count = 0;
 
-  for (uint8_t i = 0; i < target_count; i++) {
+  for (uint8_t i = 0; i < raw_target_count && i < MAX_TARGETS; i++) {
     const size_t offset = 7 + i * 4;
     const int16_t raw_x = read_i16_le_(frame, offset);
     const int16_t raw_y = read_i16_le_(frame, offset + 2);
@@ -219,16 +264,27 @@ void LD2460Component::process_report_frame_(const std::vector<uint8_t> &frame) {
     const float distance_m = std::sqrt(x_m * x_m + y_m * y_m);
     const float angle_deg = std::atan2(x_m, y_m) * RAD_TO_DEG;
 
-    targets[i].raw_x = raw_x;
-    targets[i].raw_y = raw_y;
-    targets[i].x_m = x_m;
-    targets[i].y_m = y_m;
-    targets[i].distance_m = distance_m;
-    targets[i].angle_deg = angle_deg;
+    // Filter targets by spatial threshold boundaries
+    if (x_m < this->min_x_ || x_m > this->max_x_ || y_m < this->min_y_ || y_m > this->max_y_ || distance_m > this->max_distance_) {
+      continue;
+    }
 
+    valid_targets[valid_target_count].raw_x = raw_x;
+    valid_targets[valid_target_count].raw_y = raw_y;
+    valid_targets[valid_target_count].x_m = x_m;
+    valid_targets[valid_target_count].y_m = y_m;
+    valid_targets[valid_target_count].distance_m = distance_m;
+    valid_targets[valid_target_count].angle_deg = angle_deg;
+    valid_target_count++;
+  }
+
+  std::string summary = "targets=" + std::to_string(valid_target_count);
+
+  for (uint8_t i = 0; i < valid_target_count; i++) {
     char target_summary[96];
     std::snprintf(target_summary, sizeof(target_summary), "; T%u x=%.1fm y=%.1fm d=%.1fm angle=%.1fdeg",
-                  static_cast<unsigned>(i + 1), x_m, y_m, distance_m, angle_deg);
+                  static_cast<unsigned>(i + 1), valid_targets[i].x_m, valid_targets[i].y_m,
+                  valid_targets[i].distance_m, valid_targets[i].angle_deg);
     summary += target_summary;
   }
 
@@ -238,9 +294,9 @@ void LD2460Component::process_report_frame_(const std::vector<uint8_t> &frame) {
     this->last_report_log_ms_ = now;
   }
 
-  if (this->target_state_changed_(targets, target_count) && now - this->last_publish_ms_ >= this->publish_interval_ms_) {
-    this->publish_targets_(targets, target_count, summary);
-    this->remember_published_targets_(targets, target_count);
+  if (this->target_state_changed_(valid_targets, valid_target_count) && now - this->last_publish_ms_ >= this->publish_interval_ms_) {
+    this->publish_targets_(valid_targets, valid_target_count, summary);
+    this->remember_published_targets_(valid_targets, valid_target_count);
 
     if (this->raw_text_sensor_ != nullptr)
       this->raw_text_sensor_->publish_state(format_frame_(frame));
@@ -264,6 +320,12 @@ void LD2460Component::process_command_frame_(const std::vector<uint8_t> &frame) 
       const bool success = (result & 0x10) != 0;
       const bool enabled = (result & 0x01) != 0;
       ESP_LOGI(TAG, "LD2460 reporting %s: %s", enabled ? "enable" : "disable", success ? "success" : "failed");
+      break;
+    }
+    case 0x07: {
+      if (payload_length < 1)
+        break;
+      ESP_LOGI(TAG, "LD2460 zone bounds configuration response received (0x07).");
       break;
     }
     case 0x0A: {
