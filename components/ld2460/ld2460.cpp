@@ -295,19 +295,17 @@ void LD2460Component::process_command_frame_(const std::vector<uint8_t> &frame) 
     case 0x0B: {
       if (payload_length < 5)
         break;
-      const char *mode = installation_mode_to_string_(frame[payload_offset]);
-      const uint8_t year = frame[payload_offset + 1];
-      const uint8_t month = frame[payload_offset + 2];
-      const uint8_t major = frame[payload_offset + 3];
-      const uint8_t minor = frame[payload_offset + 4];
+      // frame[payload_offset] (Byte 7) is the command execution status/result (e.g. 0x10), which is ignored here
+      const uint8_t major = frame[payload_offset + 1];
+      const uint8_t minor = frame[payload_offset + 2];
+      const uint8_t year = frame[payload_offset + 3];
+      const uint8_t month = frame[payload_offset + 4];
 
       char firmware[48];
-      std::snprintf(firmware, sizeof(firmware), "%s V%u.%u (20%02u-%02u)", mode, major, minor, year, month);
+      std::snprintf(firmware, sizeof(firmware), "V%u.%u (20%02u-%02u)", major, minor, year, month);
       ESP_LOGI(TAG, "LD2460 firmware: %s", firmware);
       if (this->firmware_text_sensor_ != nullptr)
         this->firmware_text_sensor_->publish_state(firmware);
-      if (this->installation_mode_text_sensor_ != nullptr)
-        this->installation_mode_text_sensor_->publish_state(mode);
       break;
     }
     default:
