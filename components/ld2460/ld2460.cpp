@@ -52,13 +52,21 @@ void LD2460Component::dump_config() {
 void LD2460Component::loop() {
   const uint32_t now = millis();
 
-  if (this->enable_reporting_ && this->total_bytes_ == 0 &&
-      (!this->startup_commands_sent_ || now - this->last_command_ms_ >= 10000) && now > 2000) {
-    this->select_next_baud_rate_();
-    this->log_uart_pin_levels_();
-    this->send_startup_commands_();
-    this->startup_commands_sent_ = true;
-    this->last_command_ms_ = now;
+  if (this->enable_reporting_ && now > 2000) {
+    if (!this->startup_commands_sent_) {
+      // Always send the startup command at least once after 2 seconds
+      this->select_next_baud_rate_();
+      this->log_uart_pin_levels_();
+      this->send_startup_commands_();
+      this->startup_commands_sent_ = true;
+      this->last_command_ms_ = now;
+    } else if (this->baud_scan_ && this->total_bytes_ == 0 && now - this->last_command_ms_ >= 10000) {
+      // If we sent the commands but STILL have no data after 10s, scan the next baud rate
+      this->select_next_baud_rate_();
+      this->log_uart_pin_levels_();
+      this->send_startup_commands_();
+      this->last_command_ms_ = now;
+    }
   }
 
   uint8_t byte;
@@ -297,10 +305,10 @@ void LD2460Component::process_command_frame_(const std::vector<uint8_t> &frame) 
         break;
       
       const char *mode = installation_mode_to_string_(frame[payload_offset]);
-      const uint8_t major = frame[payload_offset + 1];
-      const uint8_t minor = frame[payload_offset + 2];
-      const uint8_t year = frame[payload_offset + 3];
-      const uint8_t month = frame[payload_offset + 4];
+      const uint8_t year = frame[payload_offset + 1];
+      const uint8_t month = frame[payload_offset + 2];
+      const uint8_t major = frame[payload_offset + 3];
+      const uint8_t minor = frame[payload_offset + 4];
 
       char firmware[48];
       std::snprintf(firmware, sizeof(firmware), "%s V%u.%u (20%02u-%02u)", mode, major, minor, year, month);
